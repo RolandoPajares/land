@@ -1,17 +1,21 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { NextRequest, NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+import {
+  acquireRefreshLock,
+  consumeOAuthState,
+  deleteTokenVault,
+  loadTokenVault,
+  releaseRefreshLock,
+  saveOAuthState,
+  saveTokenVault,
+} from "@/lib/xaocode/tiktok-store";
 
 export const TIKTOK_TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/";
 export const TIKTOK_AUTHORIZE_ENDPOINT = "https://www.tiktok.com/v2/auth/authorize/";
 export const TIKTOK_API_ENDPOINT = "https://open.tiktokapis.com";
 export const TIKTOK_SCOPES = ["user.info.basic", "video.publish", "video.upload"] as const;
-
-const STATE_COOKIE = "xaocode_tiktok_oauth_state";
-const TOKEN_COOKIE = "xaocode_tiktok_vault";
-const SESSION_HEADER = "x-xaocode-tiktok-session";
-const STATE_MAX_AGE = 600;
 const REFRESH_WINDOW_MS = 5 * 60 * 1000;
-const refreshLocks = new Map<string, Promise<TikTokTokenVault>>();
+const localRefreshLocks = new Map<string, Promise<TikTokTokenVault>>();
 
 export type TikTokTokenVault = {
   accessToken: string;
@@ -30,7 +34,6 @@ type TikTokTokenResponse = {
   scope?: string;
   expires_in?: number;
   refresh_expires_in?: number;
-  error?: string;
 };
 
 export class TikTokConfigurationError extends Error {}
@@ -58,6 +61,14 @@ export function createOAuthState(): string {
   return randomBytes(32).toString("hex");
 }
 
+export async function saveOAuthStateForCallback(state: string): Promise<void> {
+  await saveOAuthState(state);
+}
+
+export async function consumeOAuthStateForCallback(state: string): Promise<boolean> {
+  return consumeOAuthState(state);
+}
+
 export function buildTikTokAuthorizationUrl(state: string): string {
   const { clientKey, redirectUri } = getTikTokConfig();
   const url = new URL(TIKTOK_AUTHORIZE_ENDPOINT);
@@ -67,28 +78,6 @@ export function buildTikTokAuthorizationUrl(state: string): string {
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("state", state);
   return url.toString();
-}
-
-function cookieOptions(maxAge: number) {
-  return {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax" as const,
-    path: "/xaocode/tiktok",
-    maxAge,
-  };
-}
-
-export function setOAuthStateCookie(response: NextResponse, state: string): void {
-  response.cookies.set(STATE_COOKIE, state, cookieOptions(STATE_MAX_AGE));
-}
-
-export function clearOAuthStateCookie(response: NextResponse): void {
-  response.cookies.set(STATE_COOKIE, "", cookieOptions(0));
-}
-
-export function getOAuthStateCookie(request: NextRequest): string | null {
-  return request.cookies.get(STATE_COOKIE)?.value ?? null;
 }
 
 function encryptionKey(): Buffer {
@@ -134,44 +123,23 @@ export function decryptTokenVault(value: string): TikTokTokenVault | null {
   }
 }
 
-function getSessionCiphertext(request: NextRequest): string | null {
-  return request.cookies.get(TOKEN_COOKIE)?.value ?? request.headers.get(SESSION_HEADER);
+function vaultTtl(vault: TikTokTokenVault): number {
+  return vault.refreshTokenExpiresAt
+    ? Math.max(60, Math.floor((vault.refreshTokenExpiresAt - Date.now()) / 1000))
+    : 60 * 60 * 24 * 30;
 }
 
-export function getTokenVault(request: NextRequest): TikTokTokenVault | null {
-  const ciphertext = getSessionCiphertext(request);
+export async function persistTokenVault(vault: TikTokTokenVault): Promise<void> {
+  await saveTokenVault(encryptTokenVault(vault), Math.min(vaultTtl(vault), 60 * 60 * 24 * 180));
+}
+
+export async function getStoredTokenVault(): Promise<TikTokTokenVault | null> {
+  const ciphertext = await loadTokenVault();
   return ciphertext ? decryptTokenVault(ciphertext) : null;
 }
 
-export function setTokenVaultCookie(response: NextResponse, vault: TikTokTokenVault): void {
-  const maxAge = vault.refreshTokenExpiresAt
-    ? Math.max(1, Math.floor((vault.refreshTokenExpiresAt - Date.now()) / 1000))
-    : 60 * 60 * 24 * 30;
-  response.cookies.set(TOKEN_COOKIE, encryptTokenVault(vault), cookieOptions(Math.min(maxAge, 60 * 60 * 24 * 180)));
-}
-
-export function clearTokenVaultCookie(response: NextResponse): void {
-  response.cookies.set(TOKEN_COOKIE, "", cookieOptions(0));
-}
-
-function safeEqual(left: string, right: string): boolean {
-  const leftBuffer = Buffer.from(left);
-  const rightBuffer = Buffer.from(right);
-  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-export function isN8nAuthorized(request: NextRequest): boolean {
-  try {
-    const authorization = request.headers.get("authorization") ?? "";
-    const provided = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-    return safeEqual(provided, getN8nSecret());
-  } catch {
-    return false;
-  }
-}
-
-export function isSessionAuthorized(request: NextRequest): boolean {
-  return getTokenVault(request) !== null;
+export async function disconnectStoredTokenVault(): Promise<void> {
+  await deleteTokenVault();
 }
 
 export async function exchangeAuthorizationCode(code: string): Promise<TikTokTokenResponse> {
@@ -179,19 +147,11 @@ export async function exchangeAuthorizationCode(code: string): Promise<TikTokTok
   const response = await fetch(TIKTOK_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_key: clientKey,
-      client_secret: clientSecret,
-      code,
-      grant_type: "authorization_code",
-      redirect_uri: redirectUri,
-    }),
+    body: new URLSearchParams({ client_key: clientKey, client_secret: clientSecret, code, grant_type: "authorization_code", redirect_uri: redirectUri }),
     cache: "no-store",
   });
   const payload = (await response.json().catch(() => ({}))) as TikTokTokenResponse;
-  if (!response.ok || !payload.access_token || !payload.refresh_token || !payload.open_id) {
-    throw new Error("TikTok no devolvió tokens válidos.");
-  }
+  if (!response.ok || !payload.access_token || !payload.refresh_token || !payload.open_id) throw new Error("TikTok no devolvió tokens válidos.");
   return payload;
 }
 
@@ -200,41 +160,65 @@ export async function refreshTikTokToken(vault: TikTokTokenVault): Promise<TikTo
   const response = await fetch(TIKTOK_TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_key: clientKey,
-      client_secret: clientSecret,
-      grant_type: "refresh_token",
-      refresh_token: vault.refreshToken,
-    }),
+    body: new URLSearchParams({ client_key: clientKey, client_secret: clientSecret, grant_type: "refresh_token", refresh_token: vault.refreshToken }),
     cache: "no-store",
   });
   const payload = (await response.json().catch(() => ({}))) as TikTokTokenResponse;
   if (!response.ok || !payload.access_token || !payload.refresh_token) throw new Error("No se pudo renovar el acceso de TikTok.");
-  return {
+  const refreshed = {
     ...vault,
     accessToken: payload.access_token,
     refreshToken: payload.refresh_token,
     accessTokenExpiresAt: Date.now() + (payload.expires_in ?? 0) * 1000,
     refreshTokenExpiresAt: payload.refresh_expires_in ? Date.now() + payload.refresh_expires_in * 1000 : vault.refreshTokenExpiresAt,
   };
+  await persistTokenVault(refreshed);
+  return refreshed;
 }
 
-export async function getValidTokenVault(request: NextRequest): Promise<TikTokTokenVault | null> {
-  const vault = getTokenVault(request);
+export async function getValidTokenVault(): Promise<TikTokTokenVault | null> {
+  const vault = await getStoredTokenVault();
   if (!vault) return null;
   if (vault.accessTokenExpiresAt - Date.now() > REFRESH_WINDOW_MS) return vault;
   const lockKey = createHash("sha256").update(vault.refreshToken, "utf8").digest("hex");
-  const runningRefresh = refreshLocks.get(lockKey);
-  if (runningRefresh) return runningRefresh.catch(() => null);
-  const refreshPromise = refreshTikTokToken(vault);
-  refreshLocks.set(lockKey, refreshPromise);
+  const localLock = localRefreshLocks.get(lockKey);
+  if (localLock) return localLock.catch(() => null);
+  const refreshPromise = refreshWithDistributedLock(vault);
+  localRefreshLocks.set(lockKey, refreshPromise);
   try {
     return await refreshPromise;
   } catch {
     return null;
   } finally {
-    refreshLocks.delete(lockKey);
+    localRefreshLocks.delete(lockKey);
   }
+}
+
+async function refreshWithDistributedLock(vault: TikTokTokenVault): Promise<TikTokTokenVault> {
+  const lockValue = await acquireRefreshLock(vault.refreshToken);
+  if (lockValue) {
+    try {
+      return await refreshTikTokToken(vault);
+    } finally {
+      await releaseRefreshLock(vault.refreshToken, lockValue);
+    }
+  }
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    const latest = await getStoredTokenVault();
+    if (latest && latest.accessToken !== vault.accessToken && latest.accessTokenExpiresAt > Date.now()) return latest;
+  }
+  throw new Error("Otra instancia está renovando el token.");
+}
+
+export function isN8nAuthorized(request: NextRequest): boolean {
+  const authorization = request.headers.get("authorization") ?? "";
+  const provided = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  const expected = process.env.N8N_INTEGRATION_SECRET?.trim();
+  if (!expected || !provided) return false;
+  const providedBuffer = Buffer.from(provided);
+  const expectedBuffer = Buffer.from(expected);
+  return providedBuffer.length === expectedBuffer.length && timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
 export function vaultToPublicStatus(vault: TikTokTokenVault) {
@@ -257,5 +241,16 @@ export async function callTikTokJson(path: string, accessToken: string, body?: u
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error("TikTok rechazó la solicitud.");
+  return payload;
+}
+
+export async function callTikTokGet(path: string, accessToken: string) {
+  const response = await fetch(`${TIKTOK_API_ENDPOINT}${path}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${accessToken}` },
+    cache: "no-store",
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error("TikTok rechazó la consulta.");
   return payload;
 }

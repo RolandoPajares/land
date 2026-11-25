@@ -1,16 +1,17 @@
 import { NextResponse } from "next/server";
-import { buildTikTokAuthorizationUrl, createOAuthState, setOAuthStateCookie, TikTokConfigurationError } from "@/lib/xaocode/tiktok";
+import { buildTikTokAuthorizationUrl, createOAuthState, saveOAuthStateForCallback, TikTokConfigurationError } from "@/lib/xaocode/tiktok";
+import { TikTokStorageConfigurationError } from "@/lib/xaocode/tiktok-store";
 
 export const runtime = "nodejs";
 
-export function GET() {
+export async function GET() {
   try {
     const state = createOAuthState();
+    await saveOAuthStateForCallback(state);
     const response = NextResponse.redirect(buildTikTokAuthorizationUrl(state));
-    setOAuthStateCookie(response, state);
     return response;
   } catch (error) {
-    const message = error instanceof TikTokConfigurationError ? error.message : "La conexión de TikTok no está configurada.";
+    const message = error instanceof TikTokConfigurationError || error instanceof TikTokStorageConfigurationError ? error.message : "La conexión de TikTok no está configurada.";
     return NextResponse.json({ error: message }, { status: 503 });
   }
 }

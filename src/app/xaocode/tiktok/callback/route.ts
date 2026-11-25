@@ -1,12 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  clearOAuthStateCookie,
   exchangeAuthorizationCode,
-  getOAuthStateCookie,
-  setTokenVaultCookie,
+  consumeOAuthStateForCallback,
+  persistTokenVault,
   TikTokConfigurationError,
 } from "@/lib/xaocode/tiktok";
-import { timingSafeEqual } from "node:crypto";
 
 export const runtime = "nodejs";
 
@@ -17,25 +15,16 @@ function htmlResponse(title: string, message: string, status = 200) {
   });
 }
 
-function sameState(expected: string, received: string): boolean {
-  const expectedBuffer = Buffer.from(expected);
-  const receivedBuffer = Buffer.from(received);
-  return expectedBuffer.length === receivedBuffer.length && timingSafeEqual(expectedBuffer, receivedBuffer);
-}
-
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const state = params.get("state");
   const error = params.get("error");
   const code = params.get("code");
-  const savedState = getOAuthStateCookie(request);
-  if (!state || !savedState || !sameState(savedState, state)) {
+  if (!state || !(await consumeOAuthStateForCallback(state))) {
     return htmlResponse("Solicitud no válida", "La sesión de autorización expiró o no coincide. Inicia la conexión nuevamente.", 400);
   }
   if (error) {
-    const response = htmlResponse("Autorización no completada", "TikTok no autorizó la conexión. Puedes volver a intentarlo.", 400);
-    clearOAuthStateCookie(response);
-    return response;
+    return htmlResponse("Autorización no completada", "TikTok no autorizó la conexión. Puedes volver a intentarlo.", 400);
   }
   if (!code) return htmlResponse("Callback incompleto", "TikTok no devolvió un código de autorización.", 400);
 
@@ -51,9 +40,8 @@ export async function GET(request: NextRequest) {
       refreshTokenExpiresAt: tokenResponse.refresh_expires_in ? now + tokenResponse.refresh_expires_in * 1000 : null,
       connectedAt: now,
     };
-    const success = htmlResponse("TikTok conectado", "La autorización se completó. Los tokens se guardaron cifrados y no se muestran en pantalla.");
-    clearOAuthStateCookie(success);
-    setTokenVaultCookie(success, vault);
+    await persistTokenVault(vault);
+    const success = htmlResponse("TikTok conectado", "La autorización se completó. Los tokens se guardaron cifrados en el servidor y no se muestran en pantalla.");
     return success;
   } catch (error) {
     const message = error instanceof TikTokConfigurationError ? "La integración no está configurada en el servidor." : "TikTok no pudo completar el intercambio de autorización.";
